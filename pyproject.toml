@@ -65,5 +65,19 @@ extra-dependencies = [
   "hypothesis",
 ]
 
+# Documentation environment. Build the site with `hatch run docs:build`,
+# preview locally with `hatch run docs:serve`, and deploy with
+# `hatch run docs:deploy`.
+[tool.hatch.envs.docs]
+detached = true
+dependencies = [
+  "zensical",
+]
+
+[tool.hatch.envs.docs.scripts]
+serve = "zensical serve {args}"
+build = "zensical build {args}"
+deploy = "zensical gh-deploy --force {args}"
+
 [tool.pyrefly]
 preset = "strict"

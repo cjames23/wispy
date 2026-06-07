@@ -1,0 +1,63 @@
+# Zensical configuration for the wispy documentation site.
+#
+# Build:    hatch run docs:build
+# Preview:  hatch run docs:serve  (then open http://localhost:8000)
+# Deploy:   hatch run docs:deploy
+#
+# See https://zensical.org/docs/setup/basics/ for the full settings reference.
+
+[project]
+site_name = "wispy"
+site_description = "The whitespace between your workflow tool and everything that talks to it — a Python library implementing the Workflow Server Protocol (WSP)."
+site_author = "Cary Hawkins"
+site_url = "https://cjames23.github.io/wispy/"
+copyright = "&copy; 2026 Cary Hawkins"
+docs_dir = "docs"
+site_dir = "site"
+
+[project.repo]
+url = "https://github.com/cjames23/wispy/"
+name = "cjames23/wispy"
+
+[project.theme]
+variant = "modern"
+
+[[project.nav]]
+title = "Home"
+path = "index.md"
+
+[[project.nav]]
+title = "Getting started"
+path = "getting-started.md"
+
+[[project.nav]]
+title = "Concepts"
+children = [
+  { title = "Protocol overview",   path = "concepts/protocol.md"   },
+  { title = "Lifecycle",           path = "concepts/lifecycle.md"  },
+  { title = "Error model",         path = "concepts/errors.md"     },
+  { title = "Transport & framing", path = "concepts/transport.md"  },
+]
+
+[[project.nav]]
+title = "Guides"
+children = [
+  { title = "Embed wispy in a workflow tool", path = "guides/embed-library.md" },
+  { title = "Ship a Config_File",             path = "guides/config-file.md"   },
+  { title = "Use the wsp CLI",                path = "guides/cli.md"           },
+]
+
+[[project.nav]]
+title = "Reference"
+children = [
+  { title = "WSP methods", path = "reference/methods.md" },
+  { title = "Public API",  path = "reference/api.md"     },
+  { title = "Exit codes",  path = "reference/exit-codes.md" },
+]
+
+[[project.nav]]
+title = "Development"
+children = [
+  { title = "Contributing", path = "development/contributing.md" },
+  { title = "Testing",      path = "development/testing.md"      },
+]
