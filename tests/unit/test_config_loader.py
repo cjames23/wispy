@@ -24,6 +24,8 @@ from wispy.config import (
     ConfigEntry,
     ConfigError,
     PythonHandlerSpec,
+    ResultMode,
+    SubprocessHandlerSpec,
     load_config,
 )
 
@@ -200,3 +202,166 @@ def test_toml_and_json_identical_schemas_produce_equal_entries(
     assert toml_entries == expected
     assert json_entries == expected
     assert toml_entries == json_entries
+
+
+# ---------------------------------------------------------------------------
+# Result-mode validation (subprocess handlers).
+# ---------------------------------------------------------------------------
+
+
+def test_subprocess_default_result_mode_is_per_method(tmp_path: Path) -> None:
+    """Each WSP method has a default ``result`` mode used when none is set.
+
+    ``environment/list`` defaults to ``json``; ``environment/create``
+    defaults to ``template`` (and so requires an explicit template,
+    tested separately); ``environment/execute`` defaults to ``exec``;
+    ``shutdown`` defaults to ``none``.
+    """
+
+    p = _write(
+        tmp_path / "cfg.toml",
+        '[handlers]\n"environment/list" = { command = ["echo"] }\n',
+    )
+    entries = load_config(p)
+    spec = entries[0].spec
+    assert isinstance(spec, SubprocessHandlerSpec)
+    assert spec.result_mode is ResultMode.JSON
+
+
+def test_subprocess_explicit_result_json(tmp_path: Path) -> None:
+    """``result = "json"`` is accepted on subprocess entries."""
+
+    p = _write(
+        tmp_path / "cfg.toml",
+        '[handlers]\n"environment/list" = { command = ["echo"], result = "json" }\n',
+    )
+    entries = load_config(p)
+    spec = entries[0].spec
+    assert isinstance(spec, SubprocessHandlerSpec)
+    assert spec.result_mode is ResultMode.JSON
+
+
+def test_subprocess_explicit_result_exec(tmp_path: Path) -> None:
+    """``result = "exec"`` is accepted on subprocess entries."""
+
+    p = _write(
+        tmp_path / "cfg.toml",
+        '[handlers]\n"environment/execute" = { command = ["echo"], result = "exec" }\n',
+    )
+    entries = load_config(p)
+    spec = entries[0].spec
+    assert isinstance(spec, SubprocessHandlerSpec)
+    assert spec.result_mode is ResultMode.EXEC
+
+
+def test_subprocess_explicit_result_none(tmp_path: Path) -> None:
+    """``result = "none"`` is accepted on subprocess entries."""
+
+    p = _write(
+        tmp_path / "cfg.toml",
+        '[handlers]\nshutdown = { command = ["echo"], result = "none" }\n',
+    )
+    entries = load_config(p)
+    spec = entries[0].spec
+    assert isinstance(spec, SubprocessHandlerSpec)
+    assert spec.result_mode is ResultMode.NONE
+
+
+def test_subprocess_unknown_result_mode_rejected(tmp_path: Path) -> None:
+    """An unrecognized ``result`` value is rejected with a helpful message."""
+    p = _write(
+        tmp_path / "cfg.toml",
+        '[handlers]\n"environment/list" = { command = ["echo"], result = "yaml" }\n',
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(p)
+    msg = str(excinfo.value)
+    assert "result" in msg
+    assert "yaml" in msg
+
+
+def test_subprocess_template_mode_requires_template(tmp_path: Path) -> None:
+    """``result = "template"`` without a ``template`` table is rejected."""
+    p = _write(
+        tmp_path / "cfg.toml",
+        '[handlers]\n"environment/create" = { command = ["echo"], result = "template" }\n',
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(p)
+    msg = str(excinfo.value)
+    assert "template" in msg
+    assert "result" in msg
+
+
+def test_subprocess_template_without_mode_rejected(tmp_path: Path) -> None:
+    """A ``template`` table on a non-template result is rejected.
+
+    Using the default-template-mode method (``environment/create``)
+    here would let the validator silently accept a stray template; we
+    pick a method whose default mode is JSON so the error surfaces.
+    """
+    p = _write(
+        tmp_path / "cfg.toml",
+        '[handlers."environment/list"]\ncommand = ["echo"]\n'
+        'result = "json"\n'
+        "template = { id = \"x\" }\n",
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(p)
+    msg = str(excinfo.value)
+    assert "template" in msg
+
+
+def test_subprocess_template_mode_round_trip(tmp_path: Path) -> None:
+    """``result = "template"`` with a template populates the spec."""
+
+    p = _write(
+        tmp_path / "cfg.toml",
+        '[handlers."environment/create"]\n'
+        'command = ["echo"]\n'
+        'result = "template"\n'
+        'template = { id = "{name}", name = "{name}", python_version = "{python_version}" }\n',
+    )
+    entries = load_config(p)
+    spec = entries[0].spec
+    assert isinstance(spec, SubprocessHandlerSpec)
+    assert spec.result_mode is ResultMode.TEMPLATE
+    assert spec.result_template == {
+        "id": "{name}",
+        "name": "{name}",
+        "python_version": "{python_version}",
+    }
+
+
+def test_subprocess_create_default_requires_template(tmp_path: Path) -> None:
+    """``environment/create`` defaults to ``template``, so omitting it errors.
+
+    The default mode for ``environment/create`` is ``template`` (the
+    common Hatch-style adapter case). A bare ``command`` entry on
+    that method without a ``template`` is therefore rejected.
+    """
+    p = _write(
+        tmp_path / "cfg.toml",
+        '[handlers]\n"environment/create" = { command = ["echo"] }\n',
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(p)
+    msg = str(excinfo.value)
+    assert "template" in msg
+
+
+# ---------------------------------------------------------------------------
+# Python-handler keys (no subprocess-only knobs allowed).
+# ---------------------------------------------------------------------------
+
+
+def test_python_handler_with_result_key_rejected(tmp_path: Path) -> None:
+    """``result`` is subprocess-only and rejected on Python handlers."""
+    p = _write(
+        tmp_path / "cfg.toml",
+        '[handlers]\ninitialize = { import = "json.dumps", result = "json" }\n',
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(p)
+    msg = str(excinfo.value)
+    assert "result" in msg

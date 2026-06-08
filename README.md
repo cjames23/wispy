@@ -97,11 +97,30 @@ raise SystemExit(asyncio.run(run_stdio(registry)))
 
 ### Or describe a server with a Config_File
 
+If you don't want a runtime dependency on `wispy`, ship a TOML file that
+maps WSP methods to your CLI's subcommands. wispy renders the request
+params into argv with `{name}`-style substitution and constructs the WSP
+result per a per-method `result` mode.
+
 ```toml
 # my-tool.toml
-[handlers]
-"environment/list"   = { import = "my_tool.handlers:list_envs" }
-"environment/create" = { command = ["my-tool-helper", "create"] }
+[handlers."environment/list"]
+command = ["my-tool", "env", "show", "--json"]
+result = "json"
+
+[handlers."environment/create"]
+command = ["my-tool", "env", "create", "{name}", "-p", "{python_version}"]
+result = "template"
+template = { id = "{name}", name = "{name}", python_version = "{python_version}", interpreter_path = "", installed_packages = [], extra = {} }
+
+[handlers."environment/delete"]
+command = ["my-tool", "env", "remove", "{id}"]
+result = "template"
+template = { id = "{id}" }
+
+[handlers."environment/execute"]
+command = ["my-tool", "run", "-e", "{id}", "--", "{argv}"]
+result = "exec"
 ```
 
 Then any client can launch it with:
@@ -115,6 +134,11 @@ python -m wispy --config my-tool.toml
 ```sh
 wsp --config my-tool.toml environment/list
 ```
+
+See [Ship a Config_File](docs/guides/config-file.md) for the full schema
+and [Adapt an existing CLI](docs/guides/adapt-cli.md) for a worked
+example walking through how Hatch could expose its `env` subcommands as
+a WSP server with no Python glue.
 
 ## CLI exit codes
 

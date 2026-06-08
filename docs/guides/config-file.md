@@ -1,100 +1,188 @@
 # Ship a Config_File
 
-If you don't want to depend on `wispy` at runtime — for example because your
-tool is implemented in another language, or because you'd rather not pin a
-Python library version — you can describe a WSP server with a TOML or JSON
-config file and let `wispy` itself launch it.
+If you'd rather not depend on `wispy` at runtime — for example because
+you want to keep your library footprint small, or because your tool is
+implemented in another language — you can describe a WSP server with a
+TOML or JSON config file and let `wispy` itself launch it.
+
+The Config_File flow is designed to **adapt an existing CLI** to WSP
+without writing a single line of Python. You declare which subcommand
+of your CLI maps to each WSP method, how to thread the request params
+into the argv, and how to construct the WSP result from what your CLI
+already does.
 
 ## Schema
 
-The schema is the same in both formats. The top-level document is an
-object; the `handlers` key maps WSP method names to *handler entries*; each
-handler entry has exactly one of `import` or `command`.
-
-### TOML
+The schema is the same in TOML and JSON. The top-level document is an
+object; the `handlers` key maps WSP method names to *handler entries*;
+each handler entry has exactly one of `import` or `command`.
 
 ```toml
 # my-tool.toml
-[handlers]
-"environment/list"   = { import = "my_tool.handlers:list_envs" }
-"environment/create" = { command = ["my-tool-helper", "create"] }
-"environment/get"    = { command = ["my-tool-helper", "get"] }
+[handlers."environment/list"]
+command = ["my-tool", "env", "show", "--json"]
+result = "json"
+
+[handlers."environment/create"]
+command = ["my-tool", "env", "create", "{name}", "-p", "{python_version}"]
+result = "template"
+template = { id = "{name}", name = "{name}", python_version = "{python_version}", interpreter_path = "", installed_packages = [], extra = {} }
 ```
 
-### JSON
-
-```json
-{
-  "handlers": {
-    "environment/list":   {"import": "my_tool.handlers.list_envs"},
-    "environment/create": {"command": ["my-tool-helper", "create"]},
-    "environment/get":    {"command": ["my-tool-helper", "get"]}
-  }
-}
-```
-
-The extension is matched case-insensitively (`.toml` or `.json`); any other
-extension is rejected at startup.
+The extension is matched case-insensitively (`.toml` or `.json`); any
+other extension is rejected at startup.
 
 ## Handler kinds
 
-### Python imports
+### `command` — adapt an existing CLI
+
+This is the primary path the Config_File flow exists for. You declare
+the argv your tool wants to run; wispy substitutes the WSP request
+params into it, spawns the process with stdin closed (your CLI does
+not need to read JSON on stdin), and constructs the WSP result based
+on your declared `result` mode.
+
+#### Argv substitution
+
+Tokens of the form `"{key}"` in `command` are replaced with the value
+of `params.key` from the request:
 
 ```toml
-"environment/list" = { import = "my_tool.handlers.list_envs" }
+command = ["my-tool", "env", "create", "{name}", "-p", "{python_version}"]
+```
+
+Calling `environment/create` with
+`{"name": "scratch", "python_version": "3.12"}` becomes:
+
+```
+my-tool env create scratch -p 3.12
+```
+
+Substitution rules:
+
+- `"{name}"` — the entire element is replaced with the param value.
+- `"prefix-{name}-suffix"` — embedded substitution inside a single
+  argv element.
+- `"{argv}"` — special: splats a JSON array of strings into multiple
+  argv positions. Use this for `environment/execute`, where the
+  request's `argv` field is the inner command to run.
+- `"{{"` and `"}}"` produce literal `{` and `}` characters.
+
+Values are coerced to strings:
+
+| Param type | Treatment                                                |
+|-----------:|----------------------------------------------------------|
+| `string`   | Inserted as-is.                                          |
+| `integer`  | Decimal string.                                          |
+| `float`    | Decimal string.                                          |
+| `null`     | Rejected (`-31004` `EXECUTION_FAILED`).                  |
+| `boolean`  | Rejected — `"True"` is rarely what wrapped CLIs expect.  |
+| anything else | Rejected.                                             |
+
+A reference to a missing key, or a value that cannot be coerced, is
+mapped to `WspError(EXECUTION_FAILED, data={"reason": "missing-template-key"})`
+(or `"unsupported-template-value"` for the type-mismatch case).
+
+#### Result modes
+
+The `result` field declares how wispy builds the WSP method's result
+from the subprocess's outcome:
+
+| Mode         | Behaviour                                                                                              | Best for                                                              |
+|--------------|--------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------|
+| `"json"`     | Parse stdout as JSON. That value is the result. Non-zero exit → `EXECUTION_FAILED`.                    | Tools whose subcommand emits JSON (typically with a `--json` flag).    |
+| `"template"` | Render the configured `template` table from the request params. Stdout is ignored. Non-zero exit → `EXECUTION_FAILED`. | Tools whose subcommand doesn't emit the metadata WSP wants in the result; you synthesize it from the request. |
+| `"exec"`     | Result is `{exit_code, stdout, stderr}`. Non-zero exit is **not** a failure — the exit code is the value the caller wants. | `environment/execute` and similar "run something and report what happened" methods. |
+| `"none"`     | Result is `null`. Stdout is ignored. Non-zero exit → `EXECUTION_FAILED`.                               | Methods whose schema permits `null` (e.g. `shutdown`).                |
+
+Each WSP method has a sensible default mode, so most callers don't
+need to specify `result` explicitly:
+
+| Method                  | Default mode  |
+|-------------------------|---------------|
+| `initialize`            | `"json"`      |
+| `shutdown`              | `"none"`      |
+| `environment/list`      | `"json"`      |
+| `environment/get`       | `"json"`      |
+| `environment/create`    | `"template"`  |
+| `environment/delete`    | `"template"`  |
+| `environment/execute`   | `"exec"`      |
+
+Methods whose default is `"template"` still require an explicit
+`template` table — wispy can't guess your CLI's data model.
+
+#### Templates
+
+A `template` is a JSON-like table whose strings get the same
+`{key}` substitution as `command`:
+
+```toml
+[handlers."environment/create".template]
+id = "{name}"
+name = "{name}"
+python_version = "{python_version}"
+interpreter_path = ""
+installed_packages = []
+extra = {}
+```
+
+Substitution recurses through dicts and lists. Non-string scalars
+(integers, booleans, null) pass through untouched, so you can mix
+synthesized fields with literal ones.
+
+#### Stdin and timeouts
+
+- The child's stdin is closed immediately. Your CLI does not need to
+  read anything from stdin.
+- Each invocation has a 30-second wall-clock timeout. Exceeding it
+  kills the child and raises `EXECUTION_FAILED` with
+  `data.reason = "timeout"`.
+
+### `import` — host a Python callable
+
+For methods whose data model is too far from WSP's to be bridged with
+substitution and templating, fall back to a Python `import`:
+
+```toml
+[handlers."environment/get"]
+import = "my_tool_wsp.handlers.get_env"
 ```
 
 The dotted path is resolved with `importlib.import_module` plus
-`getattr`. The trailing component must point at a callable. The handler
-receives the request `params` as a single argument and returns a
-JSON-serializable value, exactly the same contract as the programmatic
-flow.
+`getattr`. The trailing component must point at a callable. The
+handler receives the request `params` as a single argument and returns
+a JSON-serializable value, exactly the same contract as the
+[programmatic flow](embed-library.md).
 
-The path is resolved at config-load time. If the import fails or the
-resolved object isn't callable, `wispy` exits with status `1` and writes
-`wispy: config error: <path>: <reason>` to stderr — *before* the transport
-is constructed, so the client never sees a partially-initialized server.
+Use this when:
 
-### Subprocess commands
+- Your CLI's output uses different field names than WSP (Hatch calls
+  it `python`; WSP calls it `python_version`).
+- The result requires rich data your CLI doesn't print
+  (`installed_packages` for `environment/get`, for example).
+- You need to call multiple subcommands and merge their output.
 
-```toml
-"environment/create" = { command = ["my-tool-helper", "create"] }
-```
-
-`command` is a non-empty array of strings. Per request, `wispy`:
-
-1. Spawns the command with `asyncio.create_subprocess_exec` and pipes
-   captured stdin, stdout, and stderr.
-2. Writes `json.dumps(params).encode("utf-8")` on the subprocess's stdin
-   and closes the pipe.
-3. Waits up to **30 seconds** for the subprocess to exit.
-4. On clean exit (return code 0) with valid JSON on stdout, returns the
-   parsed value as the JSON-RPC result.
-5. On any failure (non-zero exit, invalid JSON, timeout), kills the
-   subprocess if necessary and raises `WspError(EXECUTION_FAILED)` with
-   diagnostic context — captured stderr, return code, and a `reason`
-   discriminator — in the error's `data` field.
-
-The first element of `command` (`argv[0]`) is resolved on `PATH` at
-startup with `shutil.which`. If it's not found, the server exits with the
-same `wispy: config error:` line as for unresolvable imports.
+The Python handler can shell out to your CLI using `subprocess`,
+`asyncio.create_subprocess_exec`, or anything else. wispy doesn't care
+how it produces the result.
 
 ## Validation
 
-At startup, `wispy` validates:
+At startup, wispy validates:
 
 - The file extension and parse.
 - That the document is an object and `handlers` is an object.
 - That every method name is a defined WSP method.
 - That every handler entry has exactly one of `import` and `command`,
-  and no unknown keys.
+  and no unknown keys (Python entries accept only `import`; subprocess
+  entries accept `command`, `result`, and `template`).
 - That every `import` resolves to a callable.
 - That every `command[0]` resolves on `PATH`.
+- That `result = "template"` is paired with a `template` table.
+- That `template` is only present when `result = "template"`.
 
-Any failure is reported on stderr and the process exits with status `1`
-without serving any requests. See
-[Error model](../concepts/errors.md) for what happens once requests are
-flowing.
+Any failure is reported on stderr and the process exits with status
+`1` without serving any requests.
 
 ## Launching
 
@@ -115,16 +203,23 @@ wsp --config my-tool.toml environment/create --name scratch --python-version 3.1
 
 Two things WSP defines but the Config_File doesn't carry:
 
-- **`initialize` and `shutdown`.** `wispy` registers built-in handlers for
-  these automatically. You don't write them, and the Config_File rejects
-  attempts to override them.
+- **`initialize` and `shutdown`.** wispy registers built-in handlers
+  for these automatically. You don't write them, and the Config_File
+  rejects attempts to override them.
 - **The `exit` notification.** It's a transport-level concern, not a
   handler.
 
 ## Method not configured
 
-If a client requests a defined WSP method that your Config_File doesn't
-bind, the server returns JSON-RPC error `-32601` (method not found). The
-`Capabilities` object returned from `initialize` only advertises the
-methods you explicitly bound, so well-behaved clients will skip those
-calls in the first place.
+If a client requests a defined WSP method that your Config_File
+doesn't bind, the server returns JSON-RPC error `-32601` (method not
+found). The `Capabilities` object returned from `initialize` only
+advertises the methods you explicitly bound, so well-behaved clients
+will skip those calls in the first place.
+
+## Worked example
+
+The [Adapt an existing CLI](adapt-cli.md) page walks through every
+WSP endpoint as if Hatch had decided to adopt the Config_File flow,
+including the limitations and where you'd reach for an `import`
+handler instead.

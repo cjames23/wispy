@@ -1,32 +1,33 @@
-"""Property test for the Subprocess_Handler factory.
+"""Property and unit tests for the Subprocess_Handler factory.
 
 The Subprocess_Handler factory in :mod:`wispy.config` wraps an
 external command into a :data:`~wispy.registry.Handler` callable.
-A clean exit with valid JSON on stdout MUST
-return the parsed value. Every other outcome
-(non-zero exit, garbled JSON, timeout) MUST raise
-:class:`~wispy.errors.WspError` with code
-:data:`~wispy.errors.WspErrorCode.EXECUTION_FAILED` (-31004).
+Each WSP method's request params are substituted into the command's
+argv via ``{key}`` tokens, the process is spawned with stdin closed
+immediately, and the result is constructed per the configured
+:class:`~wispy.config.ResultMode`:
 
-The test uses a tiny Python helper script written to a tempfile.
-The script reads JSON from stdin and branches on its ``argv[1]``
-mode flag to one of four behaviours: ``echo`` (round-trip), ``fail``
-(exit non-zero), ``garbage`` (write invalid JSON), or ``sleep``
-(block past the configured timeout). The mode flag is part of the
-``argv`` baked into the :class:`~wispy.config.SubprocessHandlerSpec`,
-so each handler invocation spawns a fresh subprocess with the
-selected behaviour.
+* ``"json"``     -- parse stdout as JSON; return the parsed value.
+* ``"template"`` -- render a template table from the request params.
+* ``"exec"``     -- return ``{exit_code, stdout, stderr}``.
+* ``"none"``     -- return ``null``; non-zero exit is a failure.
 
-The factory hardcodes a 30-second wall-clock timeout
-(:data:`wispy.config._SUBPROCESS_TIMEOUT`). To exercise the timeout
-failure mode without making the test slow, the timeout test
-monkeypatches that module attribute to 0.5 s so the helper's
-``time.sleep(60)`` is observed as a timeout in well under a second.
+Failures (spawn, timeout, non-zero exit for non-exec modes,
+non-JSON stdout for ``"json"``, malformed template) all surface as
+:class:`~wispy.errors.WspError` carrying
+:data:`~wispy.errors.WspErrorCode.EXECUTION_FAILED` (-31004) with a
+``data.reason`` discriminator.
+
+Tests use a tiny Python helper script so they do not depend on any
+particular external CLI being installed. The script reads its argv
+to decide what to print and what exit code to use; this mirrors how
+real CLIs (Hatch, pip, etc.) are driven by argv rather than stdin.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import time
 from typing import TYPE_CHECKING, Any, cast
@@ -37,6 +38,7 @@ from hypothesis import strategies as st
 
 import wispy.config
 from wispy.config import (
+    ResultMode,
     SubprocessHandlerSpec,
     _make_subprocess_handler,
 )
@@ -48,32 +50,37 @@ if TYPE_CHECKING:
 
     from wispy.registry import Handler
 
+
 # Helper script source. Written to a tempfile per test session and
 # invoked via ``sys.executable`` so the test does not assume any
 # particular interpreter is on PATH.
 #
-# The script intentionally does *not* import anything from ``wispy``;
-# it must run in a bare interpreter the way a user-supplied
-# Subprocess_Handler would.
+# The script intentionally does *not* import anything from ``wispy``.
+# It accepts a mode in ``argv[1]`` and varies its output / exit
+# behaviour accordingly. ``argv[2:]`` is the rest of the rendered
+# argv -- the helper echoes those positions when asked, which lets
+# the round-trip test verify substitution worked.
 _HELPER_SOURCE = """\
 import json
 import sys
 import time
 
-mode = sys.argv[1] if len(sys.argv) > 1 else "echo"
-raw = sys.stdin.read()
-try:
-    params = json.loads(raw)
-except Exception:
-    params = None
+mode = sys.argv[1] if len(sys.argv) > 1 else "echo-argv"
+extra = sys.argv[2:]
 
-if mode == "echo":
-    sys.stdout.write(json.dumps(params))
+if mode == "echo-argv":
+    sys.stdout.write(json.dumps(extra))
+elif mode == "echo-json":
+    # Always print the same canonical JSON object on stdout. The
+    # caller asserts on this exact value.
+    sys.stdout.write(json.dumps({"ok": True, "argv": extra}))
 elif mode == "fail":
     sys.stderr.write("intentional failure\\n")
     sys.exit(7)
 elif mode == "garbage":
     sys.stdout.write("not valid json !@#$%")
+elif mode == "silent":
+    pass
 elif mode == "sleep":
     time.sleep(60)
 else:
@@ -90,49 +97,224 @@ def helper_script(tmp_path: Path) -> Path:
     return p
 
 
-def _make_handler_for_mode(helper: Path, mode: str) -> Handler:
-    """Build a Subprocess_Handler whose argv runs ``helper`` in ``mode``."""
-    spec = SubprocessHandlerSpec(argv=(sys.executable, str(helper), mode))
-    return _make_subprocess_handler(spec)
+def _spec(
+    helper: Path,
+    mode: str,
+    *,
+    template_extra: tuple[str, ...] = (),
+    result_mode: ResultMode = ResultMode.JSON,
+    result_template: Any = None,
+) -> SubprocessHandlerSpec:
+    """Build a :class:`SubprocessHandlerSpec` running ``helper`` in ``mode``."""
+    argv_template = (sys.executable, str(helper), mode, *template_extra)
+    return SubprocessHandlerSpec(
+        argv_template=argv_template,
+        result_mode=result_mode,
+        result_template=result_template,
+    )
 
 
 def _run(handler: Handler, params: Any) -> Any:
     """Invoke a Subprocess_Handler synchronously via ``asyncio.run``.
 
-    The factory always returns an ``async def`` callable (so calling it
-    yields a coroutine), but the :data:`Handler` protocol declares the
-    return type as ``Awaitable[Any] | Any`` to permit sync handlers in
-    other code paths. ``cast`` narrows the call result so pyrefly is
-    happy with passing it to :func:`asyncio.run`, which insists on a
-    proper :class:`Coroutine`.
+    The factory always returns an ``async def`` callable (so calling
+    it yields a coroutine), but the :data:`Handler` protocol declares
+    the return type as ``Awaitable[Any] | Any`` to permit sync
+    handlers in other code paths. ``cast`` narrows the call result so
+    pyrefly is happy with passing it to :func:`asyncio.run`.
     """
     coro = cast("Coroutine[Any, Any, Any]", handler(params))
     return asyncio.run(coro)
 
 
 # ---------------------------------------------------------------------- #
-# Round-trip half.
+# ResultMode.JSON.
 # ---------------------------------------------------------------------- #
 
 
-# JSON-serializable params strategy. Floats are excluded so the
-# round-trip is bit-exact: ``json.dumps`` then ``json.loads`` is only
-# guaranteed to round-trip for the JSON value space we restrict to
-# here (None, bool, int, str, list, dict). The property under test
-# is the handler's identity behaviour, not floating-point round-trip
-# semantics.
-_round_trip_params = st.recursive(
-    st.none() | st.booleans() | st.integers() | st.text(max_size=8),
-    lambda children: (
-        st.lists(children, max_size=4)
-        | st.dictionaries(
-            st.text(min_size=1, max_size=8),
-            children,
-            max_size=4,
-        )
-    ),
-    max_leaves=4,
-)
+def test_json_mode_returns_parsed_stdout(helper_script: Path) -> None:
+    """``result = "json"`` parses stdout as JSON and returns the value."""
+    spec = _spec(helper_script, "echo-json", result_mode=ResultMode.JSON)
+    handler = _make_subprocess_handler(spec)
+    result = _run(handler, {})
+    assert isinstance(result, dict)
+    assert result["ok"] is True
+
+
+def test_json_mode_garbage_raises_invalid_json_output(helper_script: Path) -> None:
+    """``result = "json"`` rejects non-JSON stdout."""
+    spec = _spec(helper_script, "garbage", result_mode=ResultMode.JSON)
+    handler = _make_subprocess_handler(spec)
+    with pytest.raises(WspError) as excinfo:
+        _run(handler, {})
+    assert excinfo.value.code == int(WspErrorCode.EXECUTION_FAILED)
+    assert isinstance(excinfo.value.data, dict)
+    assert excinfo.value.data.get("reason") == "invalid-json-output"
+
+
+# ---------------------------------------------------------------------- #
+# ResultMode.NONE.
+# ---------------------------------------------------------------------- #
+
+
+def test_none_mode_returns_null(helper_script: Path) -> None:
+    """``result = "none"`` returns None on exit 0 regardless of stdout."""
+    spec = _spec(helper_script, "silent", result_mode=ResultMode.NONE)
+    handler = _make_subprocess_handler(spec)
+    assert _run(handler, {}) is None
+
+
+def test_none_mode_nonzero_exit_raises(helper_script: Path) -> None:
+    """``result = "none"`` still treats non-zero exit as a failure."""
+    spec = _spec(helper_script, "fail", result_mode=ResultMode.NONE)
+    handler = _make_subprocess_handler(spec)
+    with pytest.raises(WspError) as excinfo:
+        _run(handler, {})
+    assert excinfo.value.code == int(WspErrorCode.EXECUTION_FAILED)
+    assert isinstance(excinfo.value.data, dict)
+    assert excinfo.value.data.get("reason") == "non-zero-exit"
+
+
+# ---------------------------------------------------------------------- #
+# ResultMode.EXEC.
+# ---------------------------------------------------------------------- #
+
+
+def test_exec_mode_returns_exit_code_stdout_stderr(helper_script: Path) -> None:
+    """``result = "exec"`` returns the captured outcome verbatim."""
+    spec = _spec(helper_script, "echo-argv", result_mode=ResultMode.EXEC)
+    handler = _make_subprocess_handler(spec)
+    result = _run(handler, {})
+    assert result["exit_code"] == 0
+    assert result["stderr"] == ""
+    # The helper printed an empty argv list because no extras were
+    # passed. (Round-trip with substitution is exercised below.)
+    assert result["stdout"] == "[]"
+
+
+def test_exec_mode_nonzero_exit_is_not_a_failure(helper_script: Path) -> None:
+    """``result = "exec"`` surfaces non-zero exits to the caller as a value.
+
+    For ``environment/execute``, the exit code IS the result. The
+    factory must not raise on non-zero exits in this mode.
+    """
+    spec = _spec(helper_script, "fail", result_mode=ResultMode.EXEC)
+    handler = _make_subprocess_handler(spec)
+    result = _run(handler, {})
+    assert result["exit_code"] == 7
+    assert "intentional failure" in result["stderr"]
+
+
+def test_exec_mode_splats_argv_token(helper_script: Path) -> None:
+    """``"{argv}"`` in the template splats a list of strings into argv.
+
+    This is the substitution mode used by ``environment/execute``:
+    the WSP request carries an ``argv`` array of strings; the
+    Config_File entry's ``command`` placeholder ``{argv}`` becomes
+    those strings inserted at that argv position.
+    """
+    spec = SubprocessHandlerSpec(
+        argv_template=(sys.executable, str(helper_script), "echo-argv", "{argv}"),
+        result_mode=ResultMode.EXEC,
+    )
+    handler = _make_subprocess_handler(spec)
+    result = _run(handler, {"argv": ["one", "two", "three"]})
+    # The helper echoes argv[2:] as JSON. The first arg is the mode
+    # ("echo-argv"); the rest is the splatted argv.
+    echoed = json.loads(result["stdout"])
+    assert echoed == ["one", "two", "three"]
+
+
+# ---------------------------------------------------------------------- #
+# ResultMode.TEMPLATE.
+# ---------------------------------------------------------------------- #
+
+
+def test_template_mode_renders_result_from_params(helper_script: Path) -> None:
+    """``result = "template"`` renders the configured table from params.
+
+    Mirrors the canonical Hatch ``environment/create`` adapter: the
+    CLI itself does not emit the created environment's metadata, so
+    wispy synthesizes the WSP result from the request params plus
+    static fields.
+    """
+    spec = _spec(
+        helper_script,
+        "silent",
+        result_mode=ResultMode.TEMPLATE,
+        result_template={
+            "id": "{name}",
+            "name": "{name}",
+            "python_version": "{python_version}",
+            "interpreter_path": "",
+            "installed_packages": [],
+            "extra": {},
+        },
+    )
+    handler = _make_subprocess_handler(spec)
+    result = _run(handler, {"name": "scratch", "python_version": "3.12"})
+    assert result == {
+        "id": "scratch",
+        "name": "scratch",
+        "python_version": "3.12",
+        "interpreter_path": "",
+        "installed_packages": [],
+        "extra": {},
+    }
+
+
+def test_template_mode_missing_param_raises(helper_script: Path) -> None:
+    """A template that references a missing key raises EXECUTION_FAILED."""
+    spec = _spec(
+        helper_script,
+        "silent",
+        result_mode=ResultMode.TEMPLATE,
+        result_template={"id": "{missing}"},
+    )
+    handler = _make_subprocess_handler(spec)
+    with pytest.raises(WspError) as excinfo:
+        _run(handler, {"name": "scratch"})
+    assert excinfo.value.code == int(WspErrorCode.EXECUTION_FAILED)
+    assert isinstance(excinfo.value.data, dict)
+    assert excinfo.value.data.get("reason") == "missing-template-key"
+
+
+def test_template_mode_nested_substitution(helper_script: Path) -> None:
+    """Templates substitute through nested dicts and lists."""
+    spec = _spec(
+        helper_script,
+        "silent",
+        result_mode=ResultMode.TEMPLATE,
+        result_template={
+            "outer": {"inner": "{name}"},
+            "list": ["{name}", "literal", "{name}"],
+        },
+    )
+    handler = _make_subprocess_handler(spec)
+    result = _run(handler, {"name": "x"})
+    assert result == {
+        "outer": {"inner": "x"},
+        "list": ["x", "literal", "x"],
+    }
+
+
+# ---------------------------------------------------------------------- #
+# Argv substitution property.
+# ---------------------------------------------------------------------- #
+
+
+def test_argv_substitution_rejects_nul_bytes(helper_script: Path) -> None:
+    """NUL bytes in a substituted value are rejected (POSIX argv forbids NUL)."""
+    spec = SubprocessHandlerSpec(
+        argv_template=(sys.executable, str(helper_script), "echo-argv", "{value}"),
+        result_mode=ResultMode.JSON,
+    )
+    handler = _make_subprocess_handler(spec)
+    with pytest.raises(WspError) as excinfo:
+        _run(handler, {"value": "a\x00b"})
+    assert excinfo.value.code == int(WspErrorCode.EXECUTION_FAILED)
+    assert isinstance(excinfo.value.data, dict)
+    assert excinfo.value.data.get("reason") == "unsupported-template-value"
 
 
 @settings(
@@ -140,128 +322,126 @@ _round_trip_params = st.recursive(
     max_examples=25,
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )
-@given(params=_round_trip_params)
-def test_round_trip(helper_script: Path, params: Any) -> None:
-    """Subprocess handler round-trip.
+@given(value=st.text(min_size=1, max_size=16).filter(lambda s: "\x00" not in s))
+def test_argv_substitution_round_trip(helper_script: Path, value: str) -> None:
+    """For any string value, ``{key}`` substitution renders it into argv.
 
-    For any JSON-serializable value ``p``, a Subprocess_Handler whose
-    child echoes its stdin verbatim MUST return a value equal to ``p``.
-    Each invocation spawns a fresh subprocess, so the property holds
-    independently of any prior call history.
+    The helper echoes argv[2:] as JSON, so we can directly observe
+    that the rendered value reached the child process unmodified.
     """
-    handler = _make_handler_for_mode(helper_script, "echo")
-    result = _run(handler, params)
-    assert result == params
+    spec = SubprocessHandlerSpec(
+        argv_template=(sys.executable, str(helper_script), "echo-argv", "{value}"),
+        result_mode=ResultMode.JSON,
+    )
+    handler = _make_subprocess_handler(spec)
+    result = _run(handler, {"value": value})
+    assert result == [value]
 
 
-# ---------------------------------------------------------------------- #
-# Failure-mapping half.
-# ---------------------------------------------------------------------- #
+def test_argv_substitution_coerces_integers(helper_script: Path) -> None:
+    """Integer params are coerced to their decimal string form."""
+    spec = SubprocessHandlerSpec(
+        argv_template=(sys.executable, str(helper_script), "echo-argv", "{count}"),
+        result_mode=ResultMode.JSON,
+    )
+    handler = _make_subprocess_handler(spec)
+    result = _run(handler, {"count": 42})
+    assert result == ["42"]
 
 
-@pytest.mark.parametrize("mode", ["fail", "garbage"])
-def test_failure_modes_raise_wsp_error(helper_script: Path, mode: str) -> None:
-    """Failure modes map to WspError(EXECUTION_FAILED).
-
-    Both a non-zero exit (``fail``) and unparseable stdout
-    (``garbage``) MUST surface as :class:`WspError` whose ``code``
-    equals :data:`WspErrorCode.EXECUTION_FAILED` (-31004). The
-    diagnostic ``data`` payload carries a ``reason`` discriminator
-    distinguishing the failure mode for the caller.
-    """
-    handler = _make_handler_for_mode(helper_script, mode)
+def test_argv_substitution_rejects_booleans(helper_script: Path) -> None:
+    """Boolean params are rejected: ``"True"`` is rarely what callers want."""
+    spec = SubprocessHandlerSpec(
+        argv_template=(sys.executable, str(helper_script), "echo-argv", "{flag}"),
+        result_mode=ResultMode.JSON,
+    )
+    handler = _make_subprocess_handler(spec)
     with pytest.raises(WspError) as excinfo:
-        _run(handler, {"x": 1})
+        _run(handler, {"flag": True})
     assert excinfo.value.code == int(WspErrorCode.EXECUTION_FAILED)
-    expected_reason = {
-        "fail": "non-zero-exit",
-        "garbage": "invalid-json-output",
-    }[mode]
     assert isinstance(excinfo.value.data, dict)
-    assert excinfo.value.data.get("reason") == expected_reason
+    assert excinfo.value.data.get("reason") == "unsupported-template-value"
 
 
-def test_timeout_raises_wsp_error(helper_script: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Timeout maps to WspError(EXECUTION_FAILED).
-
-    The factory's 30 s timeout is hardcoded as a module attribute
-    so a test can shorten it without rewriting the factory. We patch
-    it to 0.5 s and run the helper in ``sleep`` mode (which would
-    otherwise block for 60 s), then assert the failure surfaces as a
-    :class:`WspError` with the timeout discriminator.
-    """
-    monkeypatch.setattr(wispy.config, "_SUBPROCESS_TIMEOUT", 0.5)
-    handler = _make_handler_for_mode(helper_script, "sleep")
+def test_argv_substitution_missing_key_raises(helper_script: Path) -> None:
+    """Referencing a missing key raises EXECUTION_FAILED."""
+    spec = SubprocessHandlerSpec(
+        argv_template=(sys.executable, str(helper_script), "echo-argv", "{missing}"),
+        result_mode=ResultMode.JSON,
+    )
+    handler = _make_subprocess_handler(spec)
     with pytest.raises(WspError) as excinfo:
-        _run(handler, None)
+        _run(handler, {"present": "x"})
+    assert excinfo.value.code == int(WspErrorCode.EXECUTION_FAILED)
+    assert isinstance(excinfo.value.data, dict)
+    assert excinfo.value.data.get("reason") == "missing-template-key"
+
+
+def test_argv_substitution_embedded(helper_script: Path) -> None:
+    """``"prefix-{name}-suffix"`` substitutes inside a single argv element."""
+    spec = SubprocessHandlerSpec(
+        argv_template=(sys.executable, str(helper_script), "echo-argv", "prefix-{name}-suffix"),
+        result_mode=ResultMode.JSON,
+    )
+    handler = _make_subprocess_handler(spec)
+    result = _run(handler, {"name": "x"})
+    assert result == ["prefix-x-suffix"]
+
+
+# ---------------------------------------------------------------------- #
+# Failure mapping.
+# ---------------------------------------------------------------------- #
+
+
+def test_timeout_raises_wsp_error(
+    helper_script: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timeout maps to WspError(EXECUTION_FAILED, reason='timeout')."""
+    monkeypatch.setattr(wispy.config, "_SUBPROCESS_TIMEOUT", 0.5)
+    spec = _spec(helper_script, "sleep", result_mode=ResultMode.JSON)
+    handler = _make_subprocess_handler(spec)
+    with pytest.raises(WspError) as excinfo:
+        _run(handler, {})
     assert excinfo.value.code == int(WspErrorCode.EXECUTION_FAILED)
     assert isinstance(excinfo.value.data, dict)
     assert excinfo.value.data.get("reason") == "timeout"
 
 
 def test_followup_request_succeeds(helper_script: Path) -> None:
-    """A follow-up valid request to the same handler succeeds.
-
-    Each handler invocation spawns a fresh subprocess (see
-    :func:`wispy.config._make_subprocess_handler`), so a failure in
-    one call MUST NOT poison subsequent calls. We verify this by
-    invoking a ``fail``-mode handler (and confirming it raises) and
-    then invoking a fresh ``echo``-mode handler with the same spec
-    shape against the same helper script and asserting the round-trip
-    succeeds.
-
-    A separate handler object is constructed for the success call to
-    mirror the property statement: any *valid* request to a handler
-    against the same spec succeeds. (Calling ``fail_handler`` again
-    would just re-spawn the failing child, which is correct but
-    uninteresting.)
-    """
-    fail_handler = _make_handler_for_mode(helper_script, "fail")
+    """A failure does not poison subsequent requests against a new spec."""
+    fail_spec = _spec(helper_script, "fail", result_mode=ResultMode.JSON)
+    fail_handler = _make_subprocess_handler(fail_spec)
     with pytest.raises(WspError):
-        _run(fail_handler, None)
+        _run(fail_handler, {})
 
-    success_handler = _make_handler_for_mode(helper_script, "echo")
-    result = _run(success_handler, {"a": 1})
-    assert result == {"a": 1}
+    success_spec = _spec(helper_script, "echo-json", result_mode=ResultMode.JSON)
+    success_handler = _make_subprocess_handler(success_spec)
+    result = _run(success_handler, {})
+    assert result["ok"] is True
 
 
-def test_subprocess_not_alive_after_failure(helper_script: Path) -> None:
-    """Subprocess is no longer alive after a failure.
+def test_subprocess_not_alive_after_timeout(helper_script: Path) -> None:
+    """After a timeout failure, a follow-up call completes promptly.
 
-    The factory guarantees that, once the handler's coroutine
-    completes (whether by returning a value or raising
-    :class:`WspError`), the spawned subprocess has terminated. We
-    cannot directly observe the child PID from the public API, but
-    we can observe the consequence: a failed call followed by a
-    successful call against a fresh handler returns promptly and
-    correctly. If the failed call had leaked a running child, the
-    timeout test (which uses a 0.5 s patched limit) would not be
-    able to terminate within the test deadline.
-
-    This test specifically covers the timeout path, where the
-    factory must ``proc.kill()`` the child before raising. We assert
-    that after the timeout failure, a brand-new handler invocation
-    completes promptly.
+    The factory must ``proc.kill()`` the timed-out child before
+    returning. We can't observe the PID directly, but a leaked child
+    would either delay the follow-up call or starve the test runner.
     """
-    # First, force a timeout failure with a short patched limit. We
-    # cannot use ``monkeypatch`` here because this test is not a
-    # function-scoped fixture consumer in the usual sense; instead
-    # we save and restore the attribute manually.
     original_timeout = wispy.config._SUBPROCESS_TIMEOUT  # noqa: SLF001 - testing private timeout knob
     wispy.config._SUBPROCESS_TIMEOUT = 0.5  # noqa: SLF001 - testing private timeout knob
     try:
-        sleep_handler = _make_handler_for_mode(helper_script, "sleep")
+        sleep_spec = _spec(helper_script, "sleep", result_mode=ResultMode.JSON)
+        sleep_handler = _make_subprocess_handler(sleep_spec)
         with pytest.raises(WspError):
-            _run(sleep_handler, None)
+            _run(sleep_handler, {})
     finally:
         wispy.config._SUBPROCESS_TIMEOUT = original_timeout  # noqa: SLF001 - testing private timeout knob
 
-    # A follow-up echo call against a fresh handler completes
-    # promptly: if the timed-out child had not been killed, this
-    # test would either hang or run far longer than expected.
     start = time.monotonic()
-    echo_handler = _make_handler_for_mode(helper_script, "echo")
-    result = _run(echo_handler, {"ok": True})
+    success_spec = _spec(helper_script, "echo-json", result_mode=ResultMode.JSON)
+    success_handler = _make_subprocess_handler(success_spec)
+    result = _run(success_handler, {})
     elapsed = time.monotonic() - start
-    assert result == {"ok": True}
-    assert elapsed < 10.0, f"follow-up handler took {elapsed:.2f}s; the timed-out child may not have been killed"
+    assert result["ok"] is True
+    assert elapsed < 10.0, f"follow-up handler took {elapsed:.2f}s; the timed-out child may have leaked"

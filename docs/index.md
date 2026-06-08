@@ -35,6 +35,8 @@ client.
   [Embed wispy in a workflow tool](guides/embed-library.md) to wire it up in
   a few lines, or to [Ship a Config_File](guides/config-file.md) if you'd
   prefer no runtime dependency.
+- Have an existing CLI you'd like to expose over WSP? Read
+  [Adapt an existing CLI](guides/adapt-cli.md) for a worked example.
 - Just want to run commands? Skip to [Use the wsp CLI](guides/cli.md).
 
 ## Project status

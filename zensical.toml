@@ -44,6 +44,7 @@ title = "Guides"
 children = [
   { title = "Embed wispy in a workflow tool", path = "guides/embed-library.md" },
   { title = "Ship a Config_File",             path = "guides/config-file.md"   },
+  { title = "Adapt an existing CLI",          path = "guides/adapt-cli.md"     },
   { title = "Use the wsp CLI",                path = "guides/cli.md"           },
 ]
 
